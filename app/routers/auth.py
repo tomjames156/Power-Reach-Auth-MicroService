@@ -1,18 +1,26 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+import hashlib, logging
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from datetime import datetime, timedelta, timezone, tzinfo
-import hashlib
+from datetime import datetime, timedelta, timezone
+from smtplib import SMTPException, SMTPConnectError
 from ..database import get_db
 from ..models import User, AdminProfile, CustomerProfile, VendorProfile, RefreshToken, UserType
 from ..schemas import RegisterRequest, LoginRequest, TokenResponse, RefreshRequest, DeactivateRequest
-from ..security import hash_password, verify_password, create_access_token, create_refresh_token
+from ..email import send_verification_email, send_already_verified_email
+from ..security import (hash_password, verify_password, create_access_token, create_refresh_token,
+                        create_verification_token, decode_verification_token)
 from ..config import settings
 from ..dependencies import get_current_user, require_admin
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
+
 
 # add delete user account and deactivate account endpoint, add email verification flow, add password reset flow.
+# add background tasks for email sending once this is successful
+# TODO: update the query format everywhere
+# TODO: do the name email thingy
 
 @router.post("/register", response_model=dict, status_code=201)
 async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
@@ -25,6 +33,7 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
         email=payload.email,
         hashed_password=hash_password(payload.password),
         user_type=payload.user_type,
+        is_verified=False
     )
     db.add(user)
     await db.flush()  # get user.id without committing yet
@@ -38,6 +47,22 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
         db.add(AdminProfile(user_id=user.id, department=payload.department))
 
     await db.commit()
+
+    # Fire-and-forget: don't fail registration if email fails
+    token = create_verification_token(str(user.id), user.email)
+    try:
+        await send_verification_email(user.email, token)
+    except (SMTPConnectError, ConnectionRefusedError) as e:
+        # Service is down - log as CRITICAL
+        logger.critical(f"Email server unreachable: {e}")
+        # Next step: Queue this for a background retry task
+    except SMTPException as e:
+        # SMTP specific logic error (Auth, Refused, etc)
+        logger.error(f"SMTP error sending to {user.email}: {e}")
+    except Exception as e:
+        # Catch-all for unexpected internal issues
+        logger.error(f"Unexpected error in email flow: {e}")
+
     return {"message": "Registered successfully", "user_id": str(user.id)}
 
 
@@ -51,6 +76,12 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
 
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is deactivated")
+
+    if not user.is_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="Email not verified. Check your inbox or request a new verification email."
+        )
 
     # Issue tokens
     access_token = create_access_token(str(user.id), user.user_type.value)
@@ -104,7 +135,7 @@ async def logout(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
     token_hash = hashlib.sha256(payload.refresh_token.encode()).hexdigest()
     result = await db.execute(
         select(RefreshToken).where(
-            RefreshToken.token_hash == token_hash,
+            RefreshToken.token_hash.is_(token_hash),
             RefreshToken.revoked == False,
             RefreshToken.expires_at > datetime.now(timezone.utc).replace(tzinfo=None),
         )
@@ -118,13 +149,14 @@ async def logout(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
     return {"message": "Logged out"}
 
+
 @router.post("/deactivate")
 async def deactivate_account(
         payload: DeactivateRequest,
         admin: User = Depends(require_admin),
         db: AsyncSession = Depends(get_db)
 ):
-    result = await db.execute(select(User).where(User.id == payload.user_id))
+    result = await db.execute(select(User).where(User.id.is_(payload.user_id)))
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -132,3 +164,38 @@ async def deactivate_account(
     user.is_active = False
     await db.commit()
     return {"message": "Account deactivated"}
+
+
+@router.get("/verify-email")
+async def verify_email(token: str, db: AsyncSession = Depends(get_db)):
+    try:
+        payload = decode_verification_token(token)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    result = await db.execute(select(User).where(User.id == payload["sub"]))
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    if user.is_verified:
+        # Idempotent — don't error, just notify
+        await send_already_verified_email(user.email)
+        return {"message": "Already verified"}
+
+    user.is_verified = True
+    await db.commit()
+    return {"message": "Email verified. You can now log in."}
+
+
+@router.post("/resend-verification")
+async def resend_verification(
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.is_verified:
+        raise HTTPException(400, "Account is already verified")
+
+    token = create_verification_token(str(current_user.id), current_user.email)
+    await send_verification_email(current_user.email, token)
+    return {"message": "Verification email resent"}

@@ -42,3 +42,9 @@ require_admin    = require_role(UserType.admin)
 require_customer = require_role(UserType.customer)
 require_vendor   = require_role(UserType.vendor)
 require_staff    = require_role(UserType.admin, UserType.vendor)  # example multi-role
+
+
+async def require_verified(current_user: User = Depends(get_current_user)) -> User:
+    if not current_user.is_verified:
+        raise HTTPException(403, "Email verification required")
+    return current_user

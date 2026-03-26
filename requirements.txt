@@ -1,4 +1,6 @@
 fastapi
+fastapi-mail
+certifi
 uvicorn[standard]
 sqlalchemy[asyncio]
 asyncpg

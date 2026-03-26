@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 import hashlib, secrets, bcrypt
@@ -32,7 +32,7 @@ def create_access_token(user_id: str, user_type: str) -> str:
     payload = {
         "sub": user_id,
         "role": user_type,
-        "exp": datetime.utcnow() + timedelta(minutes=settings.access_token_expire_minutes),
+        "exp": datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=settings.access_token_expire_minutes),
         "type": "access",
     }
     return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
@@ -51,3 +51,23 @@ def decode_access_token(token: str) -> dict:
         return payload
     except JWTError:
         raise ValueError("Invalid or expired token")
+
+
+def create_verification_token(user_id: str, email: str) -> str:
+    """Short-lived token carrying user identity for email confirmation."""
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "type": "email_verification",
+        "exp": datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=settings.verification_token_expire_hours),
+    }
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
+
+def decode_verification_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+        if payload.get("type") != "email_verification":
+            raise ValueError("Wrong token type")
+        return payload
+    except JWTError as e:
+        raise ValueError(f"Invalid or expired verification token: {e}")
