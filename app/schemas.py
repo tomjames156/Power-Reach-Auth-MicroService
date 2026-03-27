@@ -36,3 +36,6 @@ class UserOut(BaseModel):
 
 class DeactivateRequest(BaseModel):
     user_id: UUID
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr

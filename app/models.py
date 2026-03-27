@@ -10,6 +10,7 @@ class UserType(str, enum.Enum):
     admin    = "admin"
     customer = "customer"
     vendor   = "vendor"
+    service_agent = "service_agent"
 
 class User(Base):
     __tablename__ = "users"
@@ -43,6 +44,15 @@ class CustomerProfile(Base):
     phone     = Column(String)
     tier      = Column(String, default="free")  # free, pro, enterprise
     user      = relationship("User", back_populates="customer_profile")
+
+class ServiceAgentProfile(Base):
+    __tablename__ = "service_agent_profiles"
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id     = Column(UUID(as_uuid=True), ForeignKey("users.id"), unique=True)
+    full_name   = Column(String)
+    phone       = Column(String)
+    expertise   = Column(ARRAY(String), default=[])  # e.g. ["billing", "technical"]
+    user        = relationship("User", back_populates="service_agent_profile")
 
 class VendorProfile(Base):
     __tablename__ = "vendor_profiles"

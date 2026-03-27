@@ -1,17 +1,17 @@
 import hashlib, logging
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime, timedelta, timezone
 from smtplib import SMTPException, SMTPConnectError
 from ..database import get_db
 from ..models import User, AdminProfile, CustomerProfile, VendorProfile, RefreshToken, UserType
-from ..schemas import RegisterRequest, LoginRequest, TokenResponse, RefreshRequest, DeactivateRequest
+from ..schemas import RegisterRequest, LoginRequest, TokenResponse, RefreshRequest, DeactivateRequest, ResendVerificationRequest
 from ..email import send_verification_email, send_already_verified_email
 from ..security import (hash_password, verify_password, create_access_token, create_refresh_token,
                         create_verification_token, decode_verification_token)
 from ..config import settings
-from ..dependencies import get_current_user, require_admin
+from ..dependencies import require_admin
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
@@ -23,7 +23,9 @@ logger = logging.getLogger(__name__)
 # TODO: do the name email thingy
 
 @router.post("/register", response_model=dict, status_code=201)
-async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
+async def register(payload: RegisterRequest,
+                   db: AsyncSession = Depends(get_db),
+                   background_tasks: BackgroundTasks = BackgroundTasks()):
     # Check duplicate email
     existing = await db.execute(select(User).where(User.email == payload.email))
     if existing.scalar_one_or_none():
@@ -51,7 +53,7 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     # Fire-and-forget: don't fail registration if email fails
     token = create_verification_token(str(user.id), user.email)
     try:
-        await send_verification_email(user.email, token)
+        background_tasks.add_task(send_verification_email, user.email, token)
     except (SMTPConnectError, ConnectionRefusedError) as e:
         # Service is down - log as CRITICAL
         logger.critical(f"Email server unreachable: {e}")
@@ -156,7 +158,7 @@ async def deactivate_account(
         admin: User = Depends(require_admin),
         db: AsyncSession = Depends(get_db)
 ):
-    result = await db.execute(select(User).where(User.id.is_(payload.user_id)))
+    result = await db.execute(select(User).where(User.id == payload.user_id))
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -166,8 +168,26 @@ async def deactivate_account(
     return {"message": "Account deactivated"}
 
 
+@router.post("/re-activate")
+async def reactivate_account(
+        payload: DeactivateRequest,
+        admin: User = Depends(require_admin),
+        db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(select(User).where(User.id == payload.user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.is_active = True
+    await db.commit()
+    return {"message": "Account re-activated"}
+
+
 @router.get("/verify-email")
-async def verify_email(token: str, db: AsyncSession = Depends(get_db)):
+async def verify_email(token: str,
+                       db: AsyncSession = Depends(get_db),
+                       background_tasks: BackgroundTasks = BackgroundTasks()):
     try:
         payload = decode_verification_token(token)
     except ValueError as e:
@@ -181,7 +201,7 @@ async def verify_email(token: str, db: AsyncSession = Depends(get_db)):
 
     if user.is_verified:
         # Idempotent — don't error, just notify
-        await send_already_verified_email(user.email)
+        background_tasks.add_task(send_already_verified_email, user.email)
         return {"message": "Already verified"}
 
     user.is_verified = True
@@ -191,11 +211,30 @@ async def verify_email(token: str, db: AsyncSession = Depends(get_db)):
 
 @router.post("/resend-verification")
 async def resend_verification(
-    current_user: User = Depends(get_current_user),
+    payload: ResendVerificationRequest,
+    db: AsyncSession = Depends(get_db),
+    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
-    if current_user.is_verified:
-        raise HTTPException(400, "Account is already verified")
+    # Look up user by the provided email
+    result = await db.execute(select(User).where(User.email == payload.email))
+    user = result.scalar_one_or_none()
+    if not user:
+        # Keep current behavior: report not found
+        raise HTTPException(status_code=404, detail="User not found")
 
-    token = create_verification_token(str(current_user.id), current_user.email)
-    await send_verification_email(current_user.email, token)
+    if user.is_verified:
+        # Idempotent — notify and return
+        background_tasks.add_task(send_already_verified_email, user.email)
+        return {"message": "Already verified"}
+
+    token = create_verification_token(str(user.id), user.email)
+    try:
+        background_tasks.add_task(send_verification_email, user.email, token)
+    except (SMTPConnectError, ConnectionRefusedError) as e:
+        logger.critical(f"Email server unreachable: {e}")
+    except SMTPException as e:
+        logger.error(f"SMTP error sending to {user.email}: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in email flow: {e}")
+
     return {"message": "Verification email resent"}
