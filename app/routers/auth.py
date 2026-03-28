@@ -5,7 +5,8 @@ from sqlalchemy import select
 from datetime import datetime, timedelta, timezone
 from smtplib import SMTPException, SMTPConnectError
 from ..database import get_db
-from ..models import User, AdminProfile, CustomerProfile, VendorProfile, RefreshToken, UserType
+from ..models import (User, AdminProfile, CustomerProfile, ServiceAgentProfile, EngineerProfile, RefreshToken,
+                      UserType)
 from ..schemas import RegisterRequest, LoginRequest, TokenResponse, RefreshRequest, DeactivateRequest, ResendVerificationRequest
 from ..email import send_verification_email, send_already_verified_email
 from ..security import (hash_password, verify_password, create_access_token, create_refresh_token,
@@ -21,6 +22,8 @@ logger = logging.getLogger(__name__)
 # add background tasks for email sending once this is successful
 # TODO: update the query format everywhere
 # TODO: do the name email thingy
+
+# TODO - add checks to make sure only admins can register staff accounts
 
 @router.post("/register", response_model=dict, status_code=201)
 async def register(payload: RegisterRequest,
@@ -43,10 +46,12 @@ async def register(payload: RegisterRequest,
     # Create type-specific profile
     if payload.user_type == UserType.customer:
         db.add(CustomerProfile(user_id=user.id, full_name=payload.full_name))
-    elif payload.user_type == UserType.vendor:
-        db.add(VendorProfile(user_id=user.id, company_name=payload.company_name))
+    elif payload.user_type == UserType.engineer:
+        db.add(EngineerProfile(user_id=user.id, company_name=payload.company_name))
     elif payload.user_type == UserType.admin:
         db.add(AdminProfile(user_id=user.id, department=payload.department))
+    elif payload.user_type == UserType.service_agent:
+        db.add(CustomerProfile(user_id=user.id, full_name=payload.full_name))
 
     await db.commit()
 
